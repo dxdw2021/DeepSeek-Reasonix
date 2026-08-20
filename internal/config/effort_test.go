@@ -142,6 +142,62 @@ func TestIsOllamaCloudEntry(t *testing.T) {
 	}
 }
 
+func TestIsMimoEntry(t *testing.T) {
+	for _, tc := range []struct {
+		baseURL string
+		want    bool
+	}{
+		{"https://api.xiaomimimo.com/v1", true},
+		{"https://api.xiaomimimo.com/v1/responses", true},
+		{"https://api.deepseek.com", false},
+		{"https://dashscope.aliyuncs.com/compatible-mode/v1", false},
+		{"https://api.xiaomimimo.com.attacker.example/v1", false},
+		{"https://example.com/?u=api.xiaomimimo.com", false},
+		{"", false},
+	} {
+		if got := isMimoEntry(&ProviderEntry{BaseURL: tc.baseURL}); got != tc.want {
+			t.Errorf("baseURL=%q: isMimoEntry=%v, want %v", tc.baseURL, got, tc.want)
+		}
+	}
+	if isMimoEntry(nil) {
+		t.Fatal("isMimoEntry(nil) must be false")
+	}
+}
+
+func TestMimoEffortSupportsNone(t *testing.T) {
+	e := &ProviderEntry{
+		Kind:              "responses",
+		BaseURL:           "https://api.xiaomimimo.com/v1",
+		ReasoningProtocol: ReasoningProtocolOpenAI,
+	}
+	cap := EffortCapabilityForEntry(e)
+	if !cap.Supported {
+		t.Fatal("MiMo effort must be supported")
+	}
+	for _, level := range []string{"auto", "none", "low", "medium", "high"} {
+		if !containsString(cap.Levels, level) {
+			t.Errorf("MiMo capability missing %q: %v", level, cap.Levels)
+		}
+	}
+	got, err := NormalizeEffort(e, "none")
+	if err != nil || got != "none" {
+		t.Fatalf("MiMo none = %q/%v, want none/nil", got, err)
+	}
+	for _, level := range []string{"low", "medium", "high"} {
+		if got, err := NormalizeEffort(e, level); err != nil || got != level {
+			t.Fatalf("MiMo %s = %q/%v, want %s/nil", level, got, err, level)
+		}
+	}
+	if _, err := NormalizeEffort(e, "xhigh"); err == nil {
+		t.Fatal("MiMo xhigh must be rejected")
+	}
+	// A plain OpenAI endpoint keeps rejecting none.
+	plain := &ProviderEntry{Kind: "openai", BaseURL: "https://example.com/v1", ReasoningProtocol: ReasoningProtocolOpenAI}
+	if got, err := NormalizeEffort(plain, "none"); err == nil || got != "" {
+		t.Fatalf("plain OpenAI none = %q/%v, want error", got, err)
+	}
+}
+
 func TestEffortCapabilityZhipu(t *testing.T) {
 	e := &ProviderEntry{Kind: "openai", BaseURL: "https://open.bigmodel.cn/api/paas/v4", Model: "glm-4.5-air"}
 	cap := EffortCapabilityForEntry(e)
@@ -341,6 +397,83 @@ func TestNormalizeEffortLongCat(t *testing.T) {
 		}
 		if got != tc.want {
 			t.Errorf("NormalizeEffort(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestNormalizeEffortOpencode(t *testing.T) {
+	// opencode.ai relays DeepSeek model IDs but only accepts the generic
+	// reasoning_effort depth scale (low|medium|high) — the gateway must win
+	// over the official DeepSeek registry so "disabled"/"max" normalize onto
+	// the opencode vocabulary instead of being rejected at request build.
+	e := &ProviderEntry{Kind: "openai", BaseURL: "https://opencode.ai/zen/v1", Model: "deepseek-v4-pro"}
+	cases := []struct {
+		in, want string
+		wantErr  bool
+	}{
+		{"auto", "", false}, // auto == leave to provider default == empty
+		{"low", "low", false},
+		{"medium", "medium", false},
+		{"high", "high", false},
+		{"HIGH", "high", false},  // case-insensitive
+		{"max", "high", false},   // opencode has no max depth; clamp to high
+		{"xhigh", "high", false}, // legacy alias → high
+		{"off", "low", false},    // retired "no thinking" → lowest depth
+		{"disabled", "", true},   // opencode does not support disabled; reject
+		{"enabled", "", true},    // binary knob value is not part of the depth scale
+	}
+	for _, tc := range cases {
+		got, err := NormalizeEffort(e, tc.in)
+		if tc.wantErr && err == nil {
+			t.Errorf("NormalizeEffort(%q) expected error, got %q", tc.in, got)
+			continue
+		}
+		if !tc.wantErr && err != nil {
+			t.Errorf("NormalizeEffort(%q) returned error: %v", tc.in, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("NormalizeEffort(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestEffortCapabilityOpencode(t *testing.T) {
+	// DeepSeek model IDs on the opencode gateway must surface the generic
+	// OpenAI depth scale, not the official DeepSeek disabled/high/max scale.
+	e := &ProviderEntry{Kind: "openai", BaseURL: "https://opencode.ai/zen/v1", Model: "deepseek-v4-pro"}
+	cap := EffortCapabilityForEntry(e)
+	if !cap.Supported {
+		t.Fatalf("opencode entry should expose /effort, got %+v", cap)
+	}
+	wantLevels := []string{"auto", "low", "medium", "high"}
+	if len(cap.Levels) != len(wantLevels) {
+		t.Fatalf("levels = %v, want %v", cap.Levels, wantLevels)
+	}
+	for i, l := range wantLevels {
+		if cap.Levels[i] != l {
+			t.Errorf("levels[%d] = %q, want %q", i, cap.Levels[i], l)
+		}
+	}
+	if cap.Default != "auto" {
+		t.Errorf("default = %q, want auto", cap.Default)
+	}
+}
+
+func TestIsOpencodeEntry(t *testing.T) {
+	for _, tc := range []struct {
+		baseURL string
+		want    bool
+	}{
+		{"https://opencode.ai/zen/v1", true},
+		{"https://opencode.ai/zen/go/v1", true},
+		{"https://api.deepseek.com", false},
+		{"https://api.longcat.chat/openai/v1", false},
+		{"", false},
+	} {
+		e := &ProviderEntry{Kind: "openai", BaseURL: tc.baseURL}
+		if got := isOpencodeEntry(e); got != tc.want {
+			t.Errorf("baseURL=%q: isOpencodeEntry=%v, want %v", tc.baseURL, got, tc.want)
 		}
 	}
 }

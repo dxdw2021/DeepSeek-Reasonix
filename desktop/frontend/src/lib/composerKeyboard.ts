@@ -11,6 +11,58 @@ export interface ComposerEnterKeyLike {
   shiftKey?: boolean;
 }
 
+export interface ComposerImeKeyLike {
+  key?: string;
+  isComposing?: boolean;
+  keyCode?: number;
+}
+
+// Keep the post-composition window short enough that a deliberate second
+// shortcut remains responsive while covering browser IME event reordering.
+export const IME_CONFIRM_GRACE_MS = 100;
+
+export function isImeKeyEvent(
+  event: ComposerImeKeyLike,
+  composing: boolean,
+  lastCompositionEndAt: number,
+  now = Date.now(),
+): boolean {
+  const inGraceWindow =
+    lastCompositionEndAt > 0
+    && now >= lastCompositionEndAt
+    && now - lastCompositionEndAt < IME_CONFIRM_GRACE_MS;
+  return composing || event.isComposing === true || event.keyCode === 229 || inGraceWindow;
+}
+
+export type ComposerEscapeAction = "cancel" | "pass-through";
+
+export function composerEscapeAction(
+  event: Pick<ComposerImeKeyLike, "key">,
+  running: boolean,
+  composing: boolean,
+): ComposerEscapeAction {
+  return event.key === "Escape" && running && !composing ? "cancel" : "pass-through";
+}
+
+export type ComposerMenuKeyAction = "handle" | "pass-through";
+
+export function composerMenuKeyAction(
+  event: Pick<ComposerImeKeyLike, "key">,
+  composing: boolean,
+): ComposerMenuKeyAction {
+  if (composing) return "pass-through";
+  switch (event.key) {
+    case "ArrowDown":
+    case "ArrowUp":
+    case "Enter":
+    case "Tab":
+    case "Escape":
+      return "handle";
+    default:
+      return "pass-through";
+  }
+}
+
 // "newline-native" keeps the browser's own line-break insertion (only the
 // plain Shift+Enter chord, today's proven path); "newline-insert" means the
 // chord has no native insertion (e.g. Ctrl+Enter) so the composer must insert
@@ -119,7 +171,12 @@ export function canUsePromptHistory(options: PromptHistoryEligibility): boolean 
   if (selectionStart !== selectionEnd) return false;
 
   if (direction === "up") {
-    return historyIndex >= 0 || selectionStart === 0;
+    // Always allow UP to recall history: in history mode it goes older; on the
+    // first press (historyIndex === -1) it enters history mode. Do not gate on
+    // cursor position — most chat apps recall history regardless of where the
+    // caret sits, and the previous "selectionStart === 0" guard made the first
+    // UP press a no-op whenever the user had typed any text.
+    return true;
   }
 
   return historyIndex >= 0 && selectionEnd === value.length;

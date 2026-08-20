@@ -2,6 +2,7 @@ package openai
 
 import (
 	"net/url"
+	"slices"
 	"strings"
 
 	"reasonix/internal/provider"
@@ -24,10 +25,8 @@ func matchesVendorHost(baseURL, apex string, canonical ...string) bool {
 		return false
 	}
 	host := strings.ToLower(u.Hostname())
-	for _, c := range canonical {
-		if host == c {
-			return true
-		}
+	if slices.Contains(canonical, host) {
+		return true
 	}
 	return strings.HasSuffix(host, "."+apex)
 }
@@ -153,6 +152,14 @@ func IsTokenRhythm(baseURL string) bool {
 // enabled|disabled rather than the generic reasoning_effort field.
 func IsLongCat(baseURL string) bool {
 	return matchesVendorHost(baseURL, "longcat.chat", "api.longcat.chat")
+}
+
+// IsOpencode reports whether baseURL points at the opencode.ai gateway
+// (opencode.ai/zen/...). It exposes OpenAI-compatible chat but gates thinking
+// with thinking.type enabled|disabled (see openai.go's thinking escape hatch),
+// so effort is surfaced as a binary knob like Zhipu/LongCat.
+func IsOpencode(baseURL string) bool {
+	return matchesVendorHost(baseURL, "opencode.ai", "opencode.ai")
 }
 
 // IsKimiAPI reports whether baseURL is one of Moonshot's official Kimi direct

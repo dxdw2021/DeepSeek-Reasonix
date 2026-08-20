@@ -15,8 +15,10 @@ import (
 	"reasonix/internal/command"
 	"reasonix/internal/config"
 	"reasonix/internal/control"
+	"reasonix/internal/event"
 	"reasonix/internal/permission"
 	"reasonix/internal/skill"
+	"reasonix/internal/tool"
 )
 
 func newTestSubagentApp(t *testing.T) *App {
@@ -424,11 +426,9 @@ func TestTrySubagentRegistryBashEnforcesReadOnlyPolicy(t *testing.T) {
 		t.Fatal("try bash should report ReadOnly=true (restricted read-only wrapper)")
 	}
 	out, err := bash.Execute(context.Background(), json.RawMessage(`{"command":"rm -rf /tmp/x"}`))
-	if err != nil {
-		t.Fatalf("blocked command should return a message, not an error: %v", err)
-	}
-	if !strings.Contains(strings.ToLower(out), "plan mode") && !strings.Contains(strings.ToLower(out), "blocked") && !strings.Contains(strings.ToLower(out), "not allowed") {
-		t.Fatalf("write-capable command should be blocked by the read-only policy, got: %s", out)
+	msg, blocked := tool.BlockedMessage(err)
+	if low := strings.ToLower(msg); !blocked || (!strings.Contains(low, "plan mode") && !strings.Contains(low, "blocked") && !strings.Contains(low, "not allowed")) {
+		t.Fatalf("write-capable command should be refused by the read-only policy, got %q, %v", out, err)
 	}
 }
 
@@ -893,7 +893,7 @@ func TestTrySubagentProfileCancelAbortsRunAndIsSingleFlight(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("try run never reached the provider")
 	}
-	if _, err := a.TrySubagentProfile(SubagentProfileInput{SystemPrompt: "p"}, "task"); err == nil || !strings.Contains(err.Error(), "in progress") {
+	if _, err := a.TrySubagentProfile(SubagentProfileInput{SystemPrompt: "p"}, "task"); err == nil || (!strings.Contains(err.Error(), "in progress") && !strings.Contains(err.Error(), "进行中")) {
 		t.Fatalf("concurrent try error = %v, want the single-flight refusal", err)
 	}
 
@@ -912,7 +912,7 @@ func TestTrySubagentProfileCancelAbortsRunAndIsSingleFlight(t *testing.T) {
 	// fast on the invalid empty response instead of blocking on the hang.
 	releaseAll()
 	a.CancelTrySubagentProfile()
-	if _, err := a.TrySubagentProfile(SubagentProfileInput{SystemPrompt: "p"}, "task"); err != nil && strings.Contains(err.Error(), "in progress") {
+	if _, err := a.TrySubagentProfile(SubagentProfileInput{SystemPrompt: "p"}, "task"); err != nil && (strings.Contains(err.Error(), "in progress") || strings.Contains(err.Error(), "进行中")) {
 		t.Fatalf("slot did not free after cancel: %v", err)
 	}
 }
@@ -948,5 +948,32 @@ func TestSkillsSettingsBodyOnlyForSubagentSkills(t *testing.T) {
 	}
 	if !sawProfile || !sawInline {
 		t.Fatalf("views missing: profile=%v inline=%v", sawProfile, sawInline)
+	}
+}
+
+func TestTryRunEventSinkRetryingLogsAndEmits(t *testing.T) {
+	a := &App{ctx: context.Background()}
+	// asyncRuntimeEmitter 异步入队（goroutine 消费），用带缓冲 channel 收集事件。
+	emitted := make(chan string, 4)
+	a.runtimeEvents = asyncRuntimeEmitter{emit: func(_ context.Context, name string, _ ...interface{}) {
+		emitted <- name
+	}}
+	sink := a.tryRunEventSink()
+	// 非 Retrying 事件应被静默丢弃（headless 无 UI），且不触发 emit。
+	sink.Emit(event.Event{Kind: event.Text, Text: "noise"})
+	select {
+	case name := <-emitted:
+		t.Fatalf("non-retrying event emitted %q, want none", name)
+	case <-time.After(200 * time.Millisecond):
+	}
+	// Retrying 事件：打印日志并 emit enhance:progress 供前端显示"重试中(n/m)"。
+	sink.Emit(event.Event{Kind: event.Retrying, RetryAttempt: 2, RetryMax: 10, RetryDelay: 500 * time.Millisecond})
+	select {
+	case name := <-emitted:
+		if name != enhanceProgressEvent {
+			t.Fatalf("Retrying emit = %q, want %s", name, enhanceProgressEvent)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("Retrying event did not emit enhance:progress")
 	}
 }

@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"reasonix/internal/provider/openai"
@@ -11,6 +12,7 @@ const (
 	ReasoningProtocolAuto     = "auto"
 	ReasoningProtocolDeepSeek = "deepseek"
 	ReasoningProtocolGLM      = "glm"
+	ReasoningProtocolKimiK3   = "kimi-k3"
 	ReasoningProtocolOpenAI   = "openai"
 	ReasoningProtocolNone     = "none"
 )
@@ -37,6 +39,15 @@ var modelReasoningCapabilities = map[string]modelReasoningCapability{
 		Default:  "high",
 		Aliases:  map[string]string{"xhigh": "high"},
 	},
+	// free 档模型同样走 DeepSeek thinking 协议：缺少该表项会让网关上的
+	// deepseek-v4-flash-free 被误判为非 deepseek（base_url 不是
+	// *.deepseek.com），tool_calls 轮不回传 reasoning_content，
+	// DeepSeek API 会 400 "reasoning_content must be passed back"。
+	"deepseek-v4-flash-free": {
+		Protocol: ReasoningProtocolDeepSeek,
+		Levels:   []string{"disabled", "high", "max"},
+		Default:  "high",
+	},
 	"deepseek-v4-pro": {Protocol: ReasoningProtocolDeepSeek, Levels: []string{"disabled", "high", "max"}, Default: "high"},
 }
 
@@ -44,8 +55,15 @@ var modelReasoningCapabilities = map[string]modelReasoningCapability{
 // provider entry. Provider implementations still decide how a stored effort is
 // serialized into requests.
 func EffortCapabilityForEntry(e *ProviderEntry) EffortCapability {
-	if explicitReasoningProtocol(e) == ReasoningProtocolNone {
+	explicitProtocol := explicitReasoningProtocol(e)
+	if explicitProtocol == ReasoningProtocolNone {
 		return EffortCapability{}
+	}
+	// Kimi K3 is a complete wire contract, including its fixed effort
+	// vocabulary. Keep any persisted supported_efforts metadata dormant while
+	// the protocol is selected so switching protocols can restore it later.
+	if explicitProtocol == ReasoningProtocolKimiK3 {
+		return kimiK3EffortCapability()
 	}
 	supported := normalizedSupportedEfforts(e)
 	if len(supported) > 0 {
@@ -58,7 +76,7 @@ func EffortCapabilityForEntry(e *ProviderEntry) EffortCapability {
 		}
 		return EffortCapability{Supported: true, Levels: levels, Default: def}
 	}
-	switch explicitReasoningProtocol(e) {
+	switch explicitProtocol {
 	case ReasoningProtocolDeepSeek:
 		if cap, ok := resolvedModelReasoningCapability(e); ok && cap.Protocol == ReasoningProtocolDeepSeek {
 			return effortCapabilityFromModel(cap)
@@ -67,6 +85,21 @@ func EffortCapabilityForEntry(e *ProviderEntry) EffortCapability {
 	case ReasoningProtocolGLM:
 		return glmEffortCapability()
 	case ReasoningProtocolOpenAI:
+		if isMimoEntry(e) {
+			// MiMo's Responses API documents a binary thinking knob: "none"
+			// disables reasoning; every other legal value enables it. The
+			// vendor accepts the OpenAI depth vocabulary but exposes no real
+			// low/medium/high difference, so mirror the documented contract.
+			return mimoEffortCapability()
+		}
+		return openAIEffortCapability()
+	}
+	// Gateway-scoped capability wins over the per-model registry: opencode.ai
+	// relays DeepSeek/GLM/etc. model IDs, so those models must not inherit the
+	// official DeepSeek scale (disabled/high/max) — the opencode gateway only
+	// accepts the generic reasoning_effort depth scale (low/medium/high) in its
+	// OpenAI-compatible chat shape (see provider/openai default branch).
+	if isOpencodeEntry(e) {
 		return openAIEffortCapability()
 	}
 	if cap, ok := resolvedModelReasoningCapability(e); ok {
@@ -77,6 +110,8 @@ func EffortCapabilityForEntry(e *ProviderEntry) EffortCapability {
 		return deepSeekEffortCapability()
 	case ReasoningProtocolGLM:
 		return glmEffortCapability()
+	case ReasoningProtocolKimiK3:
+		return kimiK3EffortCapability()
 	case ReasoningProtocolOpenAI:
 		return openAIEffortCapability()
 	}
@@ -99,6 +134,13 @@ func EffortCapabilityForEntry(e *ProviderEntry) EffortCapability {
 		// LongCat exposes the same binary thinking vocabulary on its
 		// OpenAI-compatible endpoint and documents no reasoning_effort depth scale.
 		return EffortCapability{Supported: true, Levels: []string{"auto", "enabled", "disabled"}, Default: "enabled"}
+	case isOpencodeEntry(e):
+		// opencode.ai's OpenAI-compatible gateway accepts the standard
+		// reasoning_effort depth scale (low|medium|high) — the provider layer
+		// (openai.go default branch) rejects thinking.type binary values with
+		// "effort must be low, medium, or high". Surface the same depth levels
+		// as OpenAI instead of a binary knob.
+		return openAIEffortCapability()
 	case isOllamaCloudEntry(e):
 		// Ollama Cloud accepts top-level reasoning_effort values low|medium|
 		// high|max. "none" means omit the field so the hosted model runs without
@@ -122,8 +164,12 @@ func NormalizeEffort(e *ProviderEntry, raw string) (string, error) {
 	if level == "auto" {
 		return "", nil
 	}
-	if explicitReasoningProtocol(e) == ReasoningProtocolNone {
+	explicitProtocol := explicitReasoningProtocol(e)
+	if explicitProtocol == ReasoningProtocolNone {
 		return "", effortNotConfigurableError(e)
+	}
+	if explicitProtocol == ReasoningProtocolKimiK3 {
+		return normalizeKimiK3ReasoningEffort(level)
 	}
 	supported := normalizedSupportedEfforts(e)
 	if len(supported) > 0 {
@@ -135,6 +181,23 @@ func NormalizeEffort(e *ProviderEntry, raw string) (string, error) {
 	// V4 Flash 0731 added a real low depth. Keep this model-scoped: Pro and
 	// generic DeepSeek-compatible endpoints still normalize low to high unless
 	// they explicitly advertise a different supported_efforts list.
+	if isOpencodeEntry(e) {
+		// opencode.ai relays DeepSeek/GLM/etc. model IDs but only accepts the
+		// generic reasoning_effort depth scale (low|medium|high) in its
+		// OpenAI-compatible chat shape. The gateway wins over the per-model
+		// registry so a DeepSeek model on opencode normalizes like OpenAI
+		// instead of surfacing the official disabled/high/max scale.
+		switch level {
+		case "low", "medium", "high":
+			return level, nil
+		case "max", "xhigh":
+			return "high", nil
+		case "off":
+			return "low", nil
+		default:
+			return "", fmt.Errorf("usage: /effort auto|low|medium|high")
+		}
+	}
 	if cap, ok := resolvedModelReasoningCapability(e); ok {
 		explicit := explicitReasoningProtocol(e)
 		if explicit == "" || explicit == cap.Protocol {
@@ -163,12 +226,9 @@ func NormalizeEffort(e *ProviderEntry, raw string) (string, error) {
 			return "", fmt.Errorf("usage: /effort auto|disabled|high|max")
 		}
 	case ReasoningProtocolOpenAI:
-		switch level {
-		case "low", "medium", "high":
-			return level, nil
-		default:
-			return "", fmt.Errorf("usage: /effort auto|low|medium|high")
-		}
+		return normalizeOpenAIReasoningEffort(e, level)
+	case ReasoningProtocolKimiK3:
+		return normalizeKimiK3ReasoningEffort(level)
 	case ReasoningProtocolGLM:
 		return normalizeGLMEffort(level)
 	}
@@ -210,6 +270,21 @@ func NormalizeEffort(e *ProviderEntry, raw string) (string, error) {
 		default:
 			return "", fmt.Errorf("usage: /effort auto|enabled|disabled")
 		}
+	case isOpencodeEntry(e):
+		// opencode.ai accepts the standard reasoning_effort depth scale
+		// (low|medium|high), mirroring OpenAI. Legacy depth aliases keep working.
+		switch level {
+		case "low", "medium", "high":
+			return level, nil
+		case "max":
+			return "high", nil
+		case "xhigh":
+			return "high", nil
+		case "off":
+			return "low", nil
+		default:
+			return "", fmt.Errorf("usage: /effort auto|low|medium|high")
+		}
 	case isOllamaCloudEntry(e):
 		switch level {
 		case "none", "disabled", "off":
@@ -239,7 +314,11 @@ func EffortDisplay(e *ProviderEntry) string {
 	if e == nil || strings.TrimSpace(e.Effort) == "" {
 		return "auto"
 	}
-	return normalizeEffortLevel(e.Effort)
+	effort := normalizeEffortLevel(e.Effort)
+	if explicitReasoningProtocol(e) == ReasoningProtocolKimiK3 && !isKimiK3ReasoningEffort(effort) {
+		return "auto"
+	}
+	return effort
 }
 
 // EffectiveEffort resolves the provider-visible effort value. Explicit
@@ -251,7 +330,13 @@ func EffectiveEffort(e *ProviderEntry) string {
 		return ""
 	}
 	if effort := normalizeStoredEffort(e.Effort); effort != "" {
+		if explicitReasoningProtocol(e) == ReasoningProtocolKimiK3 && !isKimiK3ReasoningEffort(effort) {
+			return ""
+		}
 		return effort
+	}
+	if explicitReasoningProtocol(e) == ReasoningProtocolKimiK3 {
+		return ""
 	}
 	supported := normalizedSupportedEfforts(e)
 	if len(supported) == 0 {
@@ -327,11 +412,15 @@ func normalizeReasoningProtocol(raw string) string {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "", ReasoningProtocolAuto:
 		return ""
-	case ReasoningProtocolDeepSeek, ReasoningProtocolGLM, ReasoningProtocolOpenAI, ReasoningProtocolNone:
+	case ReasoningProtocolDeepSeek, ReasoningProtocolGLM, ReasoningProtocolKimiK3, ReasoningProtocolOpenAI, ReasoningProtocolNone:
 		return strings.ToLower(strings.TrimSpace(raw))
 	default:
 		return ""
 	}
+}
+
+func kimiK3EffortCapability() EffortCapability {
+	return EffortCapability{Supported: true, Levels: []string{"auto", "low", "high", "max"}, Default: "max"}
 }
 
 // isDeepSeekEntry reports whether the entry points at DeepSeek's API. The
@@ -377,11 +466,42 @@ func isLongCatEntry(e *ProviderEntry) bool {
 	return e != nil && e.Kind == "openai" && openai.IsLongCat(e.BaseURL)
 }
 
+// isOpencodeEntry reports whether the entry points at the opencode.ai gateway
+// (opencode.ai/zen/...). It exposes an OpenAI-compatible chat shape and accepts
+// the generic reasoning_effort depth scale (low|medium|high), so effort is
+// surfaced as OpenAI-style depth levels (see openAIEffortCapability) rather
+// than a binary thinking.type knob.
+func isOpencodeEntry(e *ProviderEntry) bool {
+	return e != nil && e.Kind == "openai" && openai.IsOpencode(e.BaseURL)
+}
+
 // isOllamaCloudEntry reports whether the entry points at hosted Ollama Cloud,
 // whose OpenAI-compatible endpoint accepts reasoning_effort=max. Local Ollama
 // endpoints intentionally do not match.
 func isOllamaCloudEntry(e *ProviderEntry) bool {
 	return e != nil && e.Kind == "openai" && openai.IsOllamaCloud(e.BaseURL)
+}
+
+// isMimoEntry reports whether the entry points at Xiaomi MiMo's Responses API
+// (api.xiaomimimo.com). Host matching mirrors provider/responses.DetectVendor
+// but lives in the config layer to avoid an import cycle (control → config,
+// not control → provider). Host-based exact/suffix matching (not full-URL
+// substring) so unrelated or attacker-controlled URLs can't enable MiMo
+// effort. The kind check is intentionally absent: MiMo is served through both
+// kind="responses" and kind="openai" presets.
+func isMimoEntry(e *ProviderEntry) bool {
+	if e == nil {
+		return false
+	}
+	host := officialProviderHost(e.BaseURL)
+	return host == "api.xiaomimimo.com" || strings.HasSuffix(host, ".xiaomimimo.com")
+}
+
+// mimoEffortCapability mirrors MiMo's documented binary thinking knob: "none"
+// disables reasoning, every other legal value enables it (no real depth
+// difference server-side). The vendor accepts the OpenAI depth vocabulary.
+func mimoEffortCapability() EffortCapability {
+	return EffortCapability{Supported: true, Levels: []string{"auto", "none", "low", "medium", "high"}, Default: "auto"}
 }
 
 func resolvedModelReasoningCapability(e *ProviderEntry) (modelReasoningCapability, bool) {
@@ -440,12 +560,7 @@ func effortNotConfigurableError(e *ProviderEntry) error {
 }
 
 func containsString(haystack []string, needle string) bool {
-	for _, s := range haystack {
-		if s == needle {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(haystack, needle)
 }
 
 func normalizeEffortLevel(s string) string {

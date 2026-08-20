@@ -1,13 +1,17 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { CSSProperties, ClipboardEvent, DragEvent, KeyboardEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react";
-import { ArrowRight, ArrowUp, AtSign, Check, ChevronDown, ChevronUp, ChevronsUpDown, CornerDownRight, Equal, Eye, FilePlus2, FileText, Flag, Folder, Gauge, Hash, List, MessageSquare, Plus, Search, Shield, ShieldAlert, ShieldCheck, Square, Target, Trash2, X } from "lucide-react";
+import { ArrowRight, ArrowUp, AtSign, Check, ChevronsUpDown, CornerDownRight, Equal, Eye, FilePlus2, FileText, Flag, Folder, Gauge, Hash, List, Loader2, MessageSquare, Mic, MicOff, Plus, Search, Shield, ShieldAlert, ShieldCheck, Square, Target, Trash2, Undo2, Wand2, X } from "lucide-react";
 import { asArray } from "../lib/array";
 import { filterAtMatches } from "../lib/atMatches";
 import { DedupIndex, sha256 } from "../lib/attachDedup";
-import { app, onFilesDropped } from "../lib/bridge";
-import { canUsePromptHistory, composerEnterAction, insertComposerNewline, isFnKeyEvent, promptHistoryDirectionFromEvent } from "../lib/composerKeyboard";
+import { app, onEnhanceProgress, onFilesDropped, onSTTState, onSTTTranscript } from "../lib/bridge";
+import { enqueueInboxGuidance } from "../lib/inboxSubmit";
+import { formatInboxError } from "../lib/inboxError";
+import { guidanceNeedsRetry, guidanceTextMatches, kickIdleGuidance, markGuidanceQueued } from "../lib/composerGuidance";
+import { canUsePromptHistory, composerEnterAction, composerEscapeAction, composerMenuKeyAction, insertComposerNewline, isFnKeyEvent, isImeKeyEvent, promptHistoryDirectionFromEvent } from "../lib/composerKeyboard";
 import { cacheGeneration, loadOlder } from "../lib/composerHistory";
-import { SPINNER_WORDS, useI18n, type Translator } from "../lib/i18n";
+import { sessionTurnsLabel } from "../lib/sessionCatalogPresentation";
+import { SPINNER_WORDS, useI18n, type DictKey, type Translator } from "../lib/i18n";
 import { detectShortcutPlatform, formatShortcutCombo, isReservedComposerHistoryShortcut, matchesShortcut, useShortcutComboLabel } from "../lib/keyboardShortcuts";
 import { fallbackCopyText } from "../lib/clipboard";
 import {
@@ -22,6 +26,7 @@ import {
   type StructuredInvocationSubmit,
 } from "../lib/invocationDisplay";
 import { formatTokens } from "../lib/format";
+import type { ControllerLiveStore } from "../lib/useController";
 import { clearLayoutSize, loadOptionalLayoutSize, saveLayoutSize } from "../lib/layoutPreferences";
 import { createRafResizeUpdater } from "../lib/resizeDrag";
 import { observeComposerMenuViewport } from "../lib/composerMenuViewport";
@@ -44,6 +49,7 @@ import { Markdown } from "./Markdown";
 import { CodeViewer } from "./CodeViewer";
 import { ContextWindowRing } from "./ContextWindowRing";
 import { ImageViewer } from "./ImageViewer";
+import type { PendingGuidance } from "./ComposerGuidanceShelf";
 import {
   RichComposerInput,
   slashQueryAt,
@@ -65,6 +71,8 @@ import {
   type SelectedTextInsertRequest,
   type SelectedTextReference,
 } from "../lib/selectedTextContext";
+import { formatGoalWorkTime } from "../lib/goalRuntime";
+
 interface Attachment {
   path: string;
   previewUrl?: string;
@@ -92,22 +100,12 @@ const COMPOSER_RUN_STRIP_RESERVED = 30;
 const COMPOSER_MAX_VIEWPORT_RATIO = 0.4;
 const COMPOSER_AUTO_RESERVED_HEIGHT = 58;
 const PROMPT_HISTORY_PREFETCH_REMAINING = 3;
-// Grace after compositionend to swallow a confirm-Enter that lands just after
-// it; the real gap is a few ms, so keep it short or a deliberate quick second
-// Enter (submit) gets eaten too.
-const IME_CONFIRM_GRACE_MS = 100;
 const FILE_REF_SEARCH_CACHE_TTL_MS = 5000;
+const ComposerGuidanceShelf = lazy(() => import("./ComposerGuidanceShelf").then((module) => ({ default: module.ComposerGuidanceShelf })));
 
 type PastedBlock = {
   label: string;
   text: string;
-};
-
-type PendingGuidance = {
-  id: number;
-  text: string;
-  submitText: string;
-  structured?: StructuredInvocationSubmit;
 };
 
 type FileRefSearchCacheEntry = {
@@ -130,7 +128,7 @@ type ComposerDraft = {
   savedText: string;
   pendingGuidance: PendingGuidance[];
   guidanceExpanded: boolean;
-  guidanceSendingId: number | null;
+  guidanceSendingId: string | null;
   pendingPaste: number;
   submitting: boolean;
 };
@@ -265,16 +263,6 @@ function emptyComposerDraft(): ComposerDraft {
     pendingPaste: 0,
     submitting: false,
   };
-}
-
-// Exact (trimmed) equality only: the consumed-steer notice carries the steer
-// text verbatim, and substring matching removed the wrong queue item when one
-// queued text contained another (#6238).
-function guidanceTextMatches(queued: string, consumed: string): boolean {
-  const left = queued.trim();
-  const right = consumed.trim();
-  if (!left || !right) return false;
-  return left === right;
 }
 
 function cloneComposerDraft(draft: ComposerDraft): ComposerDraft {
@@ -420,23 +408,6 @@ function useTick(on: boolean): number {
   return Date.now();
 }
 
-function isImeKeyEvent(
-  e: KeyboardEvent<HTMLElement>,
-  composing: boolean,
-  lastCompositionEndAt: number,
-): boolean {
-  const native = e.nativeEvent as globalThis.KeyboardEvent & {
-    isComposing?: boolean;
-    keyCode?: number;
-  };
-  return (
-    composing ||
-    native.isComposing === true ||
-    native.keyCode === 229 ||
-    Date.now() - lastCompositionEndAt < IME_CONFIRM_GRACE_MS
-  );
-}
-
 // --- past:chats session reference → prompt context (PR-B) ---
 // Send-side helpers for "@past:chats" session references. PR-A wired the menu and
 // the composer-context card; this layer reads each referenced session through the
@@ -526,6 +497,7 @@ export function Composer({
   collaborationMode,
   toolApprovalMode,
   tokenMode,
+  turnPhase,
   goal,
   goalStatus,
   goalRuntime,
@@ -559,6 +531,11 @@ export function Composer({
   turnWaitAccumMs = 0,
   promptWaitStartedAt,
   turnTokens,
+  turnOutputTokens,
+  turnOutputCharsAtUsage,
+  turnModelActiveAt,
+  turnModelActiveMs = 0,
+  liveStore,
   turnArgChars = 0,
   retry,
   suspendedByDecision = false,
@@ -585,6 +562,8 @@ export function Composer({
   collaborationMode: CollaborationMode;
   toolApprovalMode: ToolApprovalMode;
   tokenMode: TokenMode;
+  /** Host turn phase: working | checking | verifying | reviewing */
+  turnPhase?: string;
   goal?: string;
   goalStatus?: string;
   goalRuntime?: GoalRuntime;
@@ -598,7 +577,7 @@ export function Composer({
   onSteer?: (submitText: string, tabId?: string) => void | Promise<void>;
   // Returns the un-sent text when cancelling before the server replied (so it can
   // be restored to the input); undefined for a normal cancel.
-  onCancel: () => string | undefined;
+  onCancel: (queuedItemIDs?: string[]) => string | undefined;
   onCycleMode: () => void;
   onSetMode: (mode: Mode) => void;
   onSetCollaborationMode: (mode: CollaborationMode) => void;
@@ -627,6 +606,20 @@ export function Composer({
   turnWaitAccumMs?: number;
   promptWaitStartedAt?: number;
   turnTokens?: number;
+  // Completion + reasoning tokens accumulated this turn — feeds the streaming
+  // TPS readout in the run ticker (composer-run-strip).
+  turnOutputTokens?: number;
+  // Live text+reasoning characters already covered by turnOutputTokens.
+  turnOutputCharsAtUsage?: number;
+  // Active provider-output time for the current turn; excludes tool gaps.
+  turnModelActiveAt?: number;
+  turnModelActiveMs?: number;
+  // Live-stream subscription for the character-count TPS fallback (chars ÷ 4)
+  // when the provider does not emit per-chunk usage events with token counts
+  // during streaming. Subscribing here keeps text deltas off the main state
+  // tree — only the composer re-renders, matching the controller's live-store
+  // contract (pure stream deltas must not re-render the controller owner).
+  liveStore?: ControllerLiveStore;
   // Streaming tool-call argument chars (no usage event yet) — folded into the
   // pill as an estimated-token tail so a long write_file body reads as
   // progress, not a stall.
@@ -712,16 +705,30 @@ export function Composer({
   const [selectedTextRefs, setSelectedTextRefs] = useState<SelectedTextReference[]>([]);
   const [pendingGuidance, setPendingGuidance] = useState<PendingGuidance[]>([]);
   const [guidanceExpanded, setGuidanceExpanded] = useState(false);
-  const [guidanceSendingId, setGuidanceSendingId] = useState<number | null>(null);
+  const [guidanceSendingId, setGuidanceSendingId] = useState<string | null>(null);
   const [guidanceRetryNonce, setGuidanceRetryNonce] = useState(0);
   const [guidanceDraftKey, setGuidanceDraftKey] = useState(draftKey);
   const pendingGuidanceRef = useRef<PendingGuidance[]>([]);
   const guidanceExpandedRef = useRef(false);
-  const guidanceSendingIdRef = useRef<number | null>(null);
-  const nextGuidanceId = useRef(1);
+  const guidanceSendingIdRef = useRef<string | null>(null);
   const [loadingPastChats, setLoadingPastChats] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [inputMenuPoint, setInputMenuPoint] = useState<ContextMenuPoint | null>(null);
+
+  // --- 语音转文字（STT）---
+  const [sttEnabled, setSttEnabled] = useState(false);
+  const [sttListening, setSttListening] = useState(false);
+  const [sttBusy, setSttBusy] = useState(false);
+  // 识别页正在启动（Edge 拉起中/重连中）：按钮显示加载动画，给用户即时
+  // 反馈，避免点击后半天无响应、误以为没功能而重复点击造成多窗口。
+  const [sttStarting, setSttStarting] = useState(false);
+  // 已配置的开始/停止全局快捷键（设置面板保存后刷新），用于麦克风按钮悬浮提示。
+  const [sttHotkeyStart, setSttHotkeyStart] = useState("");
+  const [sttHotkeyStop, setSttHotkeyStop] = useState("");
+  // 切换对话窗口时自动停止语音识别（[desktop] stt_auto_stop_on_switch）。
+  const [sttAutoStopOnSwitch, setSttAutoStopOnSwitch] = useState(false);
+  // 实时识别文字（interim 预览）：识别中显示在麦克风按钮上方，供即时反馈。
+  const [sttInterimText, setSttInterimText] = useState("");
   const [composerPrompt, setComposerPrompt] = useState<string | null>(null);
   // Prompt history navigation (plain ↑/↓)
   // Use refs for values read inside async closures to avoid stale captures
@@ -755,6 +762,8 @@ export function Composer({
   const wasRunningByDraftRef = useRef<Record<string, boolean>>({ [draftKey]: running });
   const composingRef = useRef(false);
   const lastCompositionEndAt = useRef(0);
+  const pastChatSearchComposingRef = useRef(false);
+  const pastChatSearchLastCompositionEndAt = useRef(0);
   const lastSelectionRef = useRef({ start: 0, end: 0 });
   const consumedInsertIdByDraftRef = useRef<Record<string, number>>({});
   const consumedSelectedTextIdByDraftRef = useRef<Record<string, number>>({});
@@ -1089,7 +1098,7 @@ export function Composer({
     draftsBySessionRef.current[targetDraftKey] = draft;
   };
 
-  const updateGuidanceSendingIdForDraft = (targetDraftKey: string, next: number | null) => {
+  const updateGuidanceSendingIdForDraft = (targetDraftKey: string, next: string | null) => {
     if (targetDraftKey === activeDraftKeyRef.current) {
       guidanceSendingIdRef.current = next;
       setGuidanceSendingId(next);
@@ -1170,39 +1179,62 @@ export function Composer({
     wasRunningByDraftRef.current[draftKey] = running;
   }, [draftKey, running, text]);
 
-  // A message queued while a turn was running (without the explicit "guide"
-  // steer click) is the user's next turn, not scratch text to discard — send
-  // it once the turn is done. Gated on submitDisabled, not just running:
-  // if the turn ends while the controller is still activating/hydrating,
-  // App's onSend silently no-ops on !controllerReady, but sendQueuedGuidance
-  // still removes the item as if it had sent — so wait for submitDisabled to
-  // clear instead of firing into that no-op window (#6210 follow-up). Once
-  // both conditions hold, a successful send removes the head and starts a
-  // new turn, which flips `running` true then false again, re-running this
-  // effect to drain the shelf one item at a time; a failed send is left in
-  // place (dismissible via the trash button) rather than silently dropped.
-  // guidanceDraftKey identifies which session the rendered queue belongs to:
-  // during a tab switch React still renders once with the previous queue, and
-  // that stale render must never submit through the new session's onSend.
+  // Legacy/local preview items still need the frontend-owned send path; durable items
+  // are dispatched and acknowledged exactly once by the Controller after TurnDone.
+  // The draft-key guard prevents this compatibility path from using a newly selected session's onSend.
   useEffect(() => {
     // Never auto-send guidance while a decision surface owns the footer —
     // the draft must stay intact until the user finishes the decision.
     if (guidanceDraftKey !== draftKey || running || submitDisabled || suspendedByDecision) return;
     const next = pendingGuidance[0];
-    if (next) void sendQueuedGuidance(next, draftKey);
+    if (next?.id.startsWith("local-")) void sendQueuedGuidance(next, draftKey);
   }, [draftKey, guidanceDraftKey, guidanceRetryNonce, running, submitDisabled, pendingGuidance, suspendedByDecision]);
 
   useEffect(() => {
-    if (guidanceDraftKey !== draftKey || !running || !guidanceQueuePreviewKey) return;
-    setGuidanceExpanded(false);
-    updatePendingGuidanceForDraft(
-      draftKey,
-      () =>
-        guidanceQueuePreviewKey
-          .split("\n")
-          .map((text) => ({ id: nextGuidanceId.current++, text, submitText: text })),
-    );
-  }, [draftKey, guidanceDraftKey, guidanceQueuePreviewKey, running]);
+    if (guidanceDraftKey !== draftKey) return;
+    let live = true;
+    const fallback = guidanceQueuePreviewKey
+      .split("\n")
+      .filter(Boolean)
+      .map((text, i) => ({ id: `local-${i}`, text, submitText: text }));
+    // Older Wails bindings and focused component tests do not expose the new
+    // inbox methods yet. Preserve their local preview contract.
+    if (typeof app.InboxSnapshot !== "function") {
+      updatePendingGuidanceForDraft(draftKey, () => fallback);
+      setGuidanceExpanded(false);
+      return;
+    }
+    // Refresh durable server metadata when running transitions change Controller-owned dispatch/ack.
+    void app.InboxSnapshot(tabId || "").then((snap) => {
+      if (!live) return;
+      const durable = (snap?.items ?? []).map((it: { id: string; preview: string; state?: string; intent?: string; source?: string }) => ({
+        id: it.id,
+        text: it.preview,
+        submitText: "",
+        state: it.state,
+        intent: it.intent,
+        source: it.source,
+        paused: Boolean(snap?.paused),
+        recoveredCount: snap?.paused && snap?.recovered
+          ? (snap.recoveredCount || snap.items.length)
+          : undefined,
+      }));
+      updatePendingGuidanceForDraft(draftKey, () => durable.length > 0 ? durable : fallback);
+      setGuidanceExpanded(false);
+    }).catch(() => {
+      if (!live) return;
+      // Fallback: local preview lines without durable ids (will re-enqueue).
+      updatePendingGuidanceForDraft(
+        draftKey,
+        () =>
+          guidanceQueuePreviewKey
+            .split("\n")
+            .filter(Boolean)
+            .map((text, i) => ({ id: `local-${i}`, text, submitText: text })),
+      );
+    });
+    return () => { live = false; };
+  }, [draftKey, guidanceDraftKey, guidanceQueuePreviewKey, running, tabId, guidanceRetryNonce]);
 
   useEffect(() => {
     if (guidanceExpanded && pendingGuidance.length <= 2) setGuidanceExpanded(false);
@@ -1250,6 +1282,96 @@ export function Composer({
     && invocations.length === 0
     && slashText.slice(0, activeSlashQuery.from).trim() === "",
   );
+
+  // --- 语音转文字（STT）：读取设置开关并订阅转录事件 ---
+  useEffect(() => {
+    let live = true;
+    const refresh = () => {
+      app.Settings()
+        .then((s) => {
+          if (!live) return;
+          setSttEnabled(Boolean(s.desktopSTTEnabled));
+          setSttHotkeyStart(s.desktopSTTHotkeyStart ?? "");
+          setSttHotkeyStop(s.desktopSTTHotkeyStop ?? "");
+          setSttAutoStopOnSwitch(Boolean(s.desktopSTTAutoStopOnSwitch));
+        })
+        .catch(() => {});
+    };
+    refresh();
+    // 设置面板保存后（如语音输入开关切换）重新读取，保证麦克风按钮即时出现/消失。
+    window.addEventListener("reasonix:desktop-settings-changed", refresh);
+    return () => {
+      live = false;
+      window.removeEventListener("reasonix:desktop-settings-changed", refresh);
+    };
+  }, []);
+
+  useEffect(() => {
+    // 用 ref 持有最新插入函数：onSTTTranscript 订阅回调在首帧闭包中创建，
+    // 直接引用 insertSTTTextAtCaret 会拿到首帧版本（draft/selection 绑定
+    // 陈旧，切换会话后转录可能写入旧 draft、"能识别但不输入"）。经 ref
+    // 中转始终调用最新实现，插入当前可见窗口输入框。
+    const insertRef = { current: insertSTTTextAtCaret };
+    // 即说即输 + 防重复：interim（实时识别）上屏“删旧插新”实时更新；
+    // 停顿 1.2s 无新 interim 时把当前句固定为已提交（不再等引擎 final）；
+    // final 到达时用已提交句去重后插入，避免 interim/final 交替重复。
+    // 这解决了“停止说话几秒才进输入框”——final 要等静音+网络往返，
+    // 停顿时先上屏、final 到了再原子替换。
+    const pendingInterimRef = { current: "" };
+    const committedInterimRef = { current: "" };
+    const COMMIT_INTERIM_MS = 1200;
+    let interimTimer = 0;
+    const unsubscribe = onSTTTranscript((payload) => {
+      if (!payload.text.trim()) return;
+      if (payload.isFinal) {
+        window.clearTimeout(interimTimer);
+        // prev 优先取未提交占位；若已停顿提交，则取已提交句去重：
+        // final 与已上屏文本相同/近似时删旧插新，结果不变（不重复）。
+        const prev = pendingInterimRef.current || committedInterimRef.current;
+        pendingInterimRef.current = "";
+        committedInterimRef.current = "";
+        setSttInterimText(""); // final 提交后清空预览
+        insertRef.current(payload.text, prev);
+      } else {
+        window.clearTimeout(interimTimer);
+        const prev = pendingInterimRef.current || committedInterimRef.current;
+        pendingInterimRef.current = payload.text;
+        committedInterimRef.current = ""; // 新 interim 开始：清除旧的已提交句标记
+        setSttInterimText(payload.text); // 实时预览（按钮上方）
+        insertRef.current(payload.text, prev); // 实时上屏（删旧插新）
+        // 停顿 1.2s 无新 interim：把当前句固定（后续 final 用
+        // committedInterimRef 去重，不会重复上屏）。
+        interimTimer = window.setTimeout(() => {
+          if (pendingInterimRef.current) {
+            committedInterimRef.current = pendingInterimRef.current;
+          }
+          pendingInterimRef.current = "";
+          setSttInterimText("");
+        }, COMMIT_INTERIM_MS);
+      }
+    });
+    // 识别状态实时同步：Edge 页自动停止/出错/恢复时，麦克风按钮随之变化。
+    const unsubscribeState = onSTTState((payload) => {
+      setSttListening(Boolean(payload.listening));
+      // starting 显式携带时同步加载态；未携带（旧 payload）则不动。
+      if (payload.starting !== undefined) setSttStarting(payload.starting);
+      // 兼容不带 starting 的旧事件：确认成功（listening=true）即结束启动态。
+      else if (payload.listening) setSttStarting(false);
+    });
+    return () => {
+      unsubscribe();
+      unsubscribeState();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  // 切换对话窗口时自动停止识别（设置开启时）：tabId 变化且正在识别则停止。
+  useEffect(() => {
+    if (!sttAutoStopOnSwitch || !sttListening) return;
+    void app.STTStop()
+      .then(() => setSttListening(false))
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tabId]);
   const slashCommandDisabled = useCallback(
     (command: CommandInfo) => !commandAvailableAtSlashPosition(command, slashCommandAtStart),
     [slashCommandAtStart],
@@ -1680,6 +1802,173 @@ export function Composer({
       composerEditSnapshot(targetDraftKey, { start: pos, end: pos }),
     );
   };
+
+  // STT 语音转录专用插入：直接在光标处连续追加文本，不加段落空行/双换行
+  // （insertTextAtCaret 是段落粘贴语义，会在前后补 \n\n，不适合逐句语音输入）。
+  // 只在"前一句以标点/空格结尾但下一句紧跟"的场景保持连续，必要时补一个空格
+  // 分隔，避免句号后直接粘连。
+  const insertSTTTextAtCaret = (snippet: string, prevSnippet?: string) => {
+    const selection = getComposerSelection();
+    const targetDraftKey = activeDraftKeyRef.current;
+    const beforeEdit = composerEditSnapshot(targetDraftKey, selection);
+    const start = selection.start;
+    const end = selection.end;
+    const current = textRef.current;
+    const body = snippet.trim();
+    if (!body) return;
+    // interim 替换：先移除上一次未提交的 interim 占位（通常位于输入末尾），
+    // 再插入新文本，实现"实时上屏、删旧插新"而不重复堆积。
+    let base = current;
+    let insertStart = start;
+    const prev = prevSnippet?.trim();
+    if (prev) {
+      const tail = base.slice(insertStart - prev.length, insertStart);
+      if (tail === prev) {
+        base = base.slice(0, insertStart - prev.length) + base.slice(insertStart);
+        insertStart -= prev.length;
+      }
+    }
+    const before = base.slice(0, insertStart);
+    const after = base.slice(end);
+    // 前面已有内容且不以空白结尾时补一个空格，避免粘连；否则直接连续。
+    const needsSpace = before.length > 0 && !/\s$/.test(before);
+    const inserted = (needsSpace ? " " : "") + body;
+    const pos = insertStart + inserted.length;
+    const updated = replaceInvocationTextRange(base, invocationsRef.current, insertStart, end, inserted);
+    textRef.current = updated.text;
+    invocationsRef.current = updated.invocations;
+    setText(updated.text);
+    setInvocations(updated.invocations);
+    setComposerSelection(pos);
+    recordComposerEdit(
+      targetDraftKey,
+      beforeEdit,
+      composerEditSnapshot(targetDraftKey, { start: pos, end: pos }),
+    );
+    void after;
+  };
+
+  // 麦克风按钮：开始/停止语音识别。禁用时按钮隐藏（由 sttEnabled 控制）。
+  const toggleSTT = useCallback(async () => {
+    if (sttBusy || sttStarting || disabled || readOnly) return;
+    setSttBusy(true);
+    try {
+      if (sttListening) {
+        await app.STTStop();
+        setSttListening(false);
+        setSttStarting(false);
+      } else {
+        // 点击瞬间即进入加载态（转圈），不等 Go 事件——首次启动 Edge
+        // 需要几秒，立即反馈避免误以为没反应而重复点击造成多窗口。
+        setSttStarting(true);
+        // 传入发起识别的 tabId：转录事件携带它，前端只插入本窗口输入框
+        // （多窗口独立绑定，不交叉错乱）。
+        await app.STTStart(tabId);
+        // 不在此处点亮录音态：由 stt:state 事件（listening=true +
+        // starting=false）确认后才点亮，确认窗口期内保持"启动中"提示，
+        // 避免 Edge/Web Speech 服务未就绪时按钮误显示为可用/录音中。
+      }
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : String(error), "warn");
+      setSttListening(false);
+      setSttStarting(false);
+    } finally {
+      setSttBusy(false);
+    }
+  }, [sttBusy, sttStarting, sttListening, disabled, readOnly, showToast]);
+  // 服务端/浏览器主动结束识别（如自动停止）时同步按钮状态。
+  useEffect(() => {
+    let live = true;
+    app.STTStatus()
+      .then((s) => {
+        if (live) setSttListening(Boolean(s.listening));
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  // --- 增强提示词（输入框右侧按钮）：调用大模型润色当前输入 ---
+  const [enhancing, setEnhancing] = useState(false);
+  // 增强前的原文（用于退回还原）；null = 当前文本就是原文。
+  const [enhancedOriginal, setEnhancedOriginal] = useState<string | null>(null);
+  // 最近一次增强的结果：用于判断用户是否在增强后又修改了输入（此时可二次增强）。
+  const [enhancedResult, setEnhancedResult] = useState<string | null>(null);
+  // 增强进行中的重试进度（Go 端 enhance:progress 事件）：非 null = provider
+  // 正在限流/网络重试，显示"重试中(n/m)"，避免转圈无反馈被误以为卡死。
+  const [enhanceRetry, setEnhanceRetry] = useState<{ attempt: number; max: number } | null>(null);
+  // 增强已等待秒数：转圈时每秒 +1 显示在按钮内，让"转好久"可见可预期。
+  const [enhanceElapsed, setEnhanceElapsed] = useState(0);
+  const enhancePrompt = useCallback(async () => {
+    const current = textRef.current.trim();
+    if (!current) {
+      showToast(t("composer.enhanceEmpty"), "warn");
+      return;
+    }
+    if (enhancing) return;
+    // 绑定发起增强时的 draft（独立绑定）：await 期间用户可能切到其他窗口，
+    // 结果必须写回发起窗口的输入框，而非"当前激活"的输入框（否则串窗口）。
+    const originDraftKey = activeDraftKeyRef.current;
+    setEnhancing(true);
+    try {
+      // 传入当前 tabId：增强按发起请求的 tab 的模型执行，
+      // 切换窗口后不会用错模型/错位。
+      const enhanced = await app.EnhancePrompt(current, tabId);
+      if (enhanced && enhanced.trim()) {
+        setEnhancedOriginal(current);       // 记住增强前文本（发起时的），供退回
+        setEnhancedResult(enhanced.trim()); // 记录增强结果，供二次增强判断
+        if (activeDraftKeyRef.current === originDraftKey) {
+          replaceComposerText(enhanced.trim());
+        } else {
+          // 用户已切到其他窗口：把增强结果写回发起 tab 的 draft，
+          // 切回该窗口时输入框可见（不污染当前窗口）。
+          const draft = cloneComposerDraft(draftsBySessionRef.current[originDraftKey] ?? emptyComposerDraft());
+          draft.text = enhanced.trim();
+          draftsBySessionRef.current[originDraftKey] = draft;
+        }
+        showToast(t("composer.enhanceDone"), "info");
+      }
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : String(error), "warn");
+    } finally {
+      setEnhancing(false);
+    }
+  }, [enhancing, showToast, t]);
+  const revertEnhancedPrompt = useCallback(() => {
+    if (enhancedOriginal == null) return;
+    replaceComposerText(enhancedOriginal);
+    setEnhancedOriginal(null);
+    setEnhancedResult(null);
+    showToast(t("composer.enhanceReverted"), "info");
+  }, [enhancedOriginal, showToast, t]);
+  // 转圈时点击取消：终止进行中的增强（Go 端 CancelTrySubagentProfile）。
+  const cancelEnhancePrompt = useCallback(() => {
+    setEnhancing(false); // 立即恢复按钮，后台取消由 Go 端 context 处理
+    void app.CancelTrySubagentProfile().catch(() => {});
+    showToast(t("composer.enhanceCancelled"), "info");
+  }, [showToast, t]);
+  // 增强进行中的进度反馈：转圈秒数 + 重试状态（enhance:progress 事件）。
+  // 消除"转好久无反馈"的焦虑：用户能看到已等待秒数与是否在重试。
+  useEffect(() => {
+    if (!enhancing) {
+      setEnhanceElapsed(0);
+      setEnhanceRetry(null);
+      return;
+    }
+    setEnhanceElapsed(0);
+    setEnhanceRetry(null);
+    const timer = window.setInterval(() => {
+      setEnhanceElapsed((s) => s + 1);
+    }, 1000);
+    const unsubscribe = onEnhanceProgress((p) => {
+      setEnhanceRetry({ attempt: p.attempt, max: p.max });
+    });
+    return () => {
+      window.clearInterval(timer);
+      unsubscribe();
+    };
+  }, [enhancing]);
 
   const replaceComposerText = (next: string) => {
     clearComposerEditHistory(activeDraftKeyRef.current);
@@ -2114,19 +2403,40 @@ export function Composer({
         const guidanceText = displayText.trim() || (structured?.display.trim() ?? "");
         const guidanceSubmitText = submitText.trim();
         if (guidanceText) {
-          const id = nextGuidanceId.current++;
-          updatePendingGuidanceForDraft(submitDraftKey, (items) => [
-            ...items,
-            { id, text: guidanceText, submitText: guidanceSubmitText || guidanceText, structured },
-          ]);
+          // Durable follow-up: only clear the composer after a durable receipt.
+          try {
+            const receipt = await enqueueInboxGuidance(app, submitTabId || "", guidanceText, guidanceSubmitText, structured);
+            if (receipt?.error) throw new Error(receipt.error);
+            updatePendingGuidanceForDraft(submitDraftKey, (items) => [
+              ...items.map((item) => receipt.paused ? { ...item, paused: true } : item),
+              {
+                id: receipt.itemId,
+                text: guidanceText.slice(0, 120),
+                submitText: "",
+                intent: "followup",
+                state: "queued",
+                source: "desktop",
+                paused: Boolean(receipt.paused),
+                structured,
+              },
+            ]);
+            clearSubmittedDraft(submitDraftKey);
+          } catch (error) {
+            showToast(formatInboxError(error, locale), "warn");
+            // Keep draft on durable failure.
+          }
         }
-        clearSubmittedDraft(submitDraftKey);
         return;
       }
       await onSend(displayText, submitText, submitTabId, structured);
       clearSubmittedDraft(submitDraftKey);
+      // 增强后的提示词已发送：完整重置增强状态（原文+结果+运行中），
+      // 按钮恢复为魔法棒（不再显示"还原"/叉叉），后续可再次增强。
+      setEnhancedOriginal(null);
+      setEnhancedResult(null);
+      setEnhancing(false);
     } catch (error) {
-      showToast(error instanceof Error ? error.message : String(error), "warn");
+      showToast(formatInboxError(error, locale), "warn");
     } finally {
       updateSubmittingForDraft(submitDraftKey, false);
     }
@@ -2138,39 +2448,85 @@ export function Composer({
     targetTabId = tabId,
   ) => {
     if (targetDraftKey !== activeDraftKeyRef.current || disabled || readOnly || guidanceSendingIdRef.current !== null) return;
+    const durable = !item.id.startsWith("local-");
     if (running && item.structured) return;
-    const displayText = item.text.trim();
-    const submitText = item.submitText.trim() || displayText;
-    if (!displayText || !submitText) return;
-    const attemptedSteer = running && onSteer !== undefined;
-    let retryRejectedSteer = false;
-    const selfDispatched = selfDispatchedGuidanceByDraftRef.current[targetDraftKey] ?? [];
-    selfDispatched.push(submitText);
-    selfDispatchedGuidanceByDraftRef.current[targetDraftKey] = selfDispatched;
     updateGuidanceSendingIdForDraft(targetDraftKey, item.id);
     try {
-      if (attemptedSteer) await onSteer(submitText, targetTabId);
-      else await onSend(displayText, submitText, targetTabId, item.structured);
-      updatePendingGuidanceForDraft(targetDraftKey, (items) => items.filter((queued) => queued.id !== item.id));
+      if (durable && guidanceNeedsRetry(item.state)) {
+        await app.RetryInboxItem(targetTabId || "", item.id);
+        updatePendingGuidanceForDraft(targetDraftKey, (items) => markGuidanceQueued(items, item.id));
+        setGuidanceRetryNonce((value) => value + 1);
+        // Idle retries dispatch a new turn in the Controller. Busy retries are
+        // requeued first, then admitted to the active turn below.
+        if (!running || item.structured) return;
+      }
+      if (durable && !running) return await kickIdleGuidance(app.SetInboxPaused, targetTabId || "", () => setGuidanceRetryNonce((value) => value + 1));
+      if (running && durable) {
+        const receipt = await app.SteerInboxItem(targetTabId || "", item.id);
+        if (receipt?.error) throw new Error(receipt.error);
+        if (receipt?.disposition === "steer_accepted") {
+          updatePendingGuidanceForDraft(targetDraftKey, (items) => items.filter((queued) => queued.id !== item.id));
+        } else {
+          // Rejected steers remain the same durable follow-up item. The
+          // Controller owns its later FIFO dispatch.
+          updatePendingGuidanceForDraft(targetDraftKey, (items) =>
+            items.map((queued) => queued.id === item.id
+              ? { ...queued, intent: "followup", state: "queued" }
+              : queued),
+          );
+          setGuidanceRetryNonce((value) => value + 1);
+        }
+        return;
+      }
+      if (durable) return;
+      // Prefer durable inbox paths: load body by id only when needed.
+      let displayText = item.text.trim();
+      let submitText = item.submitText.trim();
+      if (!submitText || submitText === displayText) {
+        try {
+          const env = await app.ReadInboxItem(targetTabId || "", item.id);
+          displayText = (env.displayText || env.submitText || displayText).trim();
+          submitText = (env.submitText || displayText).trim();
+        } catch {
+          // Fall back to preview-only shelf text.
+        }
+      }
+      if (!displayText || !submitText) return;
+      const attemptedSteer = running && onSteer !== undefined;
+      const selfDispatched = selfDispatchedGuidanceByDraftRef.current[targetDraftKey] ?? [];
+      selfDispatched.push(submitText);
+      selfDispatchedGuidanceByDraftRef.current[targetDraftKey] = selfDispatched;
+      if (attemptedSteer) {
+        await onSteer(submitText, targetTabId);
+        updatePendingGuidanceForDraft(targetDraftKey, (items) => items.filter((queued) => queued.id !== item.id));
+      } else {
+        await onSend(displayText, submitText, targetTabId, item.structured);
+        updatePendingGuidanceForDraft(targetDraftKey, (items) => items.filter((queued) => queued.id !== item.id));
+      }
       window.setTimeout(() => {
         takeSelfDispatchedGuidance(submitText, targetDraftKey);
       }, 5000);
     } catch (error) {
-      retryRejectedSteer = attemptedSteer;
-      takeSelfDispatchedGuidance(submitText, targetDraftKey);
-      showToast(error instanceof Error ? error.message : String(error), "warn");
+      showToast(formatInboxError(error, locale), "warn");
     } finally {
       const current = targetDraftKey === activeDraftKeyRef.current
         ? guidanceSendingIdRef.current
         : draftsBySessionRef.current[targetDraftKey]?.guidanceSendingId;
       if (current === item.id) updateGuidanceSendingIdForDraft(targetDraftKey, null);
-      // TurnDone may render while TrySteer is still pending. That render cannot
-      // auto-send because the guidance item is marked in flight, so re-run the
-      // idle-queue effect after a rejected steer settles. Ordinary onSend
-      // failures intentionally do not re-arm, avoiding an automatic retry loop.
-      if (retryRejectedSteer && targetDraftKey === activeDraftKeyRef.current) {
-        setGuidanceRetryNonce((value) => value + 1);
+    }
+  };
+
+  const dismissQueuedGuidance = async (item: PendingGuidance) => {
+    try {
+      if (!item.id.startsWith("local-")) {
+        await app.DeleteInboxItem(tabId || "", item.id);
       }
+      updatePendingGuidanceForDraft(
+        activeDraftKeyRef.current,
+        (items) => items.filter((queued) => queued.id !== item.id),
+      );
+    } catch (error) {
+      showToast(formatInboxError(error, locale), "warn");
     }
   };
 
@@ -2675,7 +3031,11 @@ export function Composer({
   // handleCancel stops the in-flight turn; if it was cancelled before the server
   // replied, the just-sent text is handed back so we drop it back into the input.
   const handleCancel = () => {
-    const restored = onCancel();
+    const ownedGuidance = pendingGuidance.filter((item) => item.id.startsWith("local-") || item.source === "desktop");
+    const durableItemIDs = ownedGuidance
+      .map((item) => item.id)
+      .filter((id) => !id.startsWith("local-"));
+    const restored = onCancel(durableItemIDs);
     if (goalModeOn && activeGoal) onClearGoal();
     // A user-requested cancel must not let the natural-completion effect submit
     // the queued follow-up. Fold it back into the draft: cancelling means "stop
@@ -2683,14 +3043,15 @@ export function Composer({
     // honors for un-sent text. Structured items fold back as their slash form
     // (structured.display is valid /name syntax) so the invocation survives the
     // round trip instead of degrading to its bare task text.
-    const queued = pendingGuidance
+    const queued = ownedGuidance
       .map((item) => item.structured?.display ?? item.text)
       .filter((part) => part.trim() !== "");
     if (queued.length === 0) {
       if (typeof restored === "string") setTextCaretEnd(restored);
       return;
     }
-    updatePendingGuidanceForDraft(activeDraftKeyRef.current, () => []);
+    const ownedIDs = new Set(ownedGuidance.map((item) => item.id));
+    updatePendingGuidanceForDraft(activeDraftKeyRef.current, (items) => items.filter((item) => !ownedIDs.has(item.id)));
     setGuidanceExpanded(false);
     const base = typeof restored === "string" ? restored : text;
     setTextCaretEnd([base, ...queued].filter((part) => part.trim() !== "").join("\n"));
@@ -3171,6 +3532,7 @@ export function Composer({
           title: session.title || session.topicTitle || session.preview || "Untitled",
           preview: session.preview,
           turns: session.turns,
+          turnsState: session.turnsState,
           createdAt: session.createdAt,
           lastActivityAt: session.lastActivityAt,
         },
@@ -3226,7 +3588,7 @@ export function Composer({
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement | HTMLDivElement>) => {
-    const composing = isImeKeyEvent(e, composingRef.current, lastCompositionEndAt.current);
+    const composing = isImeKeyEvent(e.nativeEvent, composingRef.current, lastCompositionEndAt.current);
     const native = e.nativeEvent as globalThis.KeyboardEvent & {
       keyCode?: number;
       which?: number;
@@ -3425,7 +3787,7 @@ export function Composer({
     }
     // Esc interrupts the in-flight turn (matches the Stop button's hint), and
     // restores the text if the server hadn't replied yet.
-    if (e.key === "Escape" && running) {
+    if (composerEscapeAction(e.nativeEvent, running, composing) === "cancel") {
       e.preventDefault();
       handleCancel();
     }
@@ -3488,7 +3850,12 @@ export function Composer({
   // menu logic. Regular typing keys (letters, Backspace, etc.) pass through
   // so the user can type a search query.
   const onPastChatSearchKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Enter" || e.key === "Tab" || e.key === "Escape") {
+    const composing = isImeKeyEvent(
+      e.nativeEvent,
+      pastChatSearchComposingRef.current,
+      pastChatSearchLastCompositionEndAt.current,
+    );
+    if (composerMenuKeyAction(e.nativeEvent, composing) === "handle") {
       e.preventDefault();
       e.stopPropagation();
       if (e.key === "ArrowDown" && count > 0) {
@@ -3584,9 +3951,14 @@ export function Composer({
   });
   const effortLevels = asArray(effort?.levels);
   const currentEffort = effort?.current || "auto";
+  // 思考模式级别按界面语言显示（与 EffortSwitcher 一致）；未定义键回退原始值。
+  const effortLabel = (level: string) => {
+    const localized = t(`effort.${level}` as DictKey);
+    return localized && localized !== `effort.${level}` ? localized : level;
+  };
   const compactEffortTitle = currentEffort === "auto"
     ? t("status.effortAutoTitle", { def: effort?.default || "auto" })
-    : `${t("status.effortTitle")}: ${currentEffort}`;
+    : `${t("status.effortTitle")}: ${effortLabel(currentEffort)}`;
   const hasEffort = Boolean(effort?.supported && effortLevels.length > 0);
   const chooseEffortLevel = (level: string) => {
     closeMoreMenu(() => {
@@ -3651,6 +4023,38 @@ export function Composer({
     closeProfileMenu();
     closeMoreMenu();
   }, [suspendedByDecision, closeIntentMenu, closeProfileMenu, closeMoreMenu]);
+  // Live text+reasoning character count for the run-strip TPS fallback. Reads
+  // through the live store's own subscription so stream deltas re-render only
+  // this component — the controller's bump path stays text-delta-free.
+  const subscribeLiveText = useCallback(
+    (cb: () => void) => liveStore?.subscribe(tabId, cb) ?? (() => {}),
+    [liveStore, tabId],
+  );
+  const liveTextChars = useSyncExternalStore(
+    subscribeLiveText,
+    () => {
+      const live = liveStore?.getSnapshot(tabId);
+      return live ? live.text.length + live.reasoning.length : 0;
+    },
+  );
+  const liveModelActiveAt = useSyncExternalStore(
+    subscribeLiveText,
+    () => liveStore?.getModelActiveAt?.(tabId),
+  );
+  const turnPhaseLabel = (() => {
+    switch ((turnPhase ?? "").trim()) {
+      case "checking":
+        return t("composer.turnPhaseChecking");
+      case "verifying":
+        return t("composer.turnPhaseVerifying");
+      case "reviewing":
+        return t("composer.turnPhaseReviewing");
+      case "working":
+        return t("composer.turnPhaseWorking");
+      default:
+        return t("composer.runAnnounceRunning");
+    }
+  })();
   const runStateText = retry
     ? t("status.retrying", { attempt: retry.attempt, max: retry.max })
     : waitingPrompt === "approval"
@@ -3658,16 +4062,28 @@ export function Composer({
       : waitingPrompt === "ask"
         ? t("composer.runWaitingAsk")
         : running && !suspendedByDecision
-          ? t("composer.runAnnounceRunning")
+          ? turnPhaseLabel
           : null;
   const runTicker = !retry && !pauseWorkClock && running && turnStartAt
     ? (() => {
         const elapsedMs = Math.max(0, now - turnStartAt - waitAccumMs);
         const words = SPINNER_WORDS[locale];
         const word = words[Math.floor(elapsedMs / 3000) % words.length];
-        const liveTokens = (turnTokens ?? 0) + Math.round((turnArgChars ?? 0) / 4);
+        const usageTokens = turnTokens ?? 0;
+        // Include streaming tool-call args in the estimate so TPS stays
+        // meaningful while the model streams a write_file / long tool body.
+        const inFlightChars = Math.max(0, liveTextChars - (turnOutputCharsAtUsage ?? 0)) + (turnArgChars ?? 0);
+        const estimatedChars = Math.round(inFlightChars / 4);
+        const liveTokens = usageTokens + estimatedChars;
         const tok = liveTokens > 0 ? ` · ↓ ${formatTokens(liveTokens)} ${t("status.tokens")}` : "";
-        return `${word}… ${fmtElapsed(elapsedMs)}${tok}`;
+        const outTok: number = (turnOutputTokens ?? 0) + estimatedChars;
+        const modelActiveAt = liveModelActiveAt ?? turnModelActiveAt;
+        const modelElapsedMs = Math.max(0, turnModelActiveMs + (modelActiveAt && modelActiveAt > 0 ? Math.max(0, now - modelActiveAt) : 0));
+        const tps = outTok > 0 && modelElapsedMs >= 500 ? Math.round(outTok / (modelElapsedMs / 1000)) : null;
+        const tpsStr = tps !== null ? ` · ${tps} tokens/s` : "";
+        const suffix = `${tpsStr}${tok}`;
+        const prefix = `${word}… ${fmtElapsed(elapsedMs)}`;
+        return { prefix, suffix: suffix || null };
       })()
     : null;
   const submitEmpty = !text.trim() && attachments.length === 0 && workspaceRefs.length === 0 &&
@@ -3685,9 +4101,6 @@ export function Composer({
         : goalModeOn && !activeGoal
           ? t("composer.goalInputPlaceholder")
           : t("composer.placeholder");
-  const hiddenGuidanceCount = Math.max(0, pendingGuidance.length - 2);
-  const visibleGuidance = guidanceExpanded ? pendingGuidance : pendingGuidance.slice(0, 2);
-  const showGuidanceExpander = pendingGuidance.length > 2;
   const composerMetaClass = [
     "composer-meta",
     hasEffort ? "composer-meta--has-effort" : "composer-meta--no-effort",
@@ -3896,12 +4309,9 @@ export function Composer({
                   <span className="composer-intent-menu__goal-runtime-line">
                     {t("composer.goalRuntimeLine", {
                       turnsUsed: goalRuntime.turnsUsed,
-                      turnsLimit: goalRuntime.turnsLimit,
                       tokensUsed: formatTokens(goalRuntime.tokensUsed),
-                      tokensLimit: formatTokens(goalRuntime.tokensLimit),
-                      noProgressTurns: goalRuntime.noProgressTurns,
-                      noProgressLimit: goalRuntime.noProgressLimit,
-                      extensions: goalRuntime.budgetExtensions,
+                      requestsUsed: goalRuntime.requestsUsed ?? 0,
+                      workTime: formatGoalWorkTime(goalRuntime.workDurationMs),
                     })}
                   </span>
                 )}
@@ -3965,8 +4375,8 @@ export function Composer({
         >
           <div className="composer-access-menu__label">{t("composer.runtimeProfileTitle")}</div>
           {([
-            ["economy", Gauge, "composer.runtimeProfileEconomy", "composer.runtimeProfileEconomyDesc"],
-            ["full", Equal, "composer.runtimeProfileBalanced", "composer.runtimeProfileBalancedDesc"],
+            ["economy", Gauge, "composer.runtimeProfileEconomy", "composer.runtimeProfileEconomyDesc"], // light wire dual-write
+            ["full", Equal, "composer.runtimeProfileBalanced", "composer.runtimeProfileBalancedDesc"], // balanced wire dual-write
             ["delivery", Flag, "composer.runtimeProfileDelivery", "composer.runtimeProfileDeliveryDesc"],
           ] as const).map(([profile, Icon, titleKey, descKey]) => (
             <button
@@ -4064,6 +4474,16 @@ export function Composer({
                       setPastChatQuery(ev.target.value);
                       setActive(0);
                     }}
+                    onCompositionStart={() => {
+                      pastChatSearchComposingRef.current = true;
+                    }}
+                    onCompositionEnd={() => {
+                      pastChatSearchComposingRef.current = false;
+                      pastChatSearchLastCompositionEndAt.current = Date.now();
+                    }}
+                    onBlur={() => {
+                      pastChatSearchComposingRef.current = false;
+                    }}
                     onKeyDown={onPastChatSearchKeyDown}
                   />
                 </div>
@@ -4073,21 +4493,19 @@ export function Composer({
                   </div>
                 ) : (
                   filteredPastChats.map((session, i) => {
-                    // PR-C2: hover preview uses only the SessionMeta fields we
-                    // already have on hand — no extra PreviewSession call, no
-                    // backend round-trip, no read of the full transcript.
-                    const turns = typeof session.turns === "number";
+                    // Hover preview stays on SessionMeta and never reads the transcript.
+                    const turnsLabel = sessionTurnsLabel(session, t);
                     const ts = session.lastActivityAt || session.modTime || session.createdAt;
                     const preview = truncatePreview(session.preview);
                     const pathText = session.workspaceRoot || session.path;
                     const tooltipLabel =
-                      turns || ts || preview || pathText ? (
+                      turnsLabel || ts || preview || pathText ? (
                         <div className="past-chat-hover">
                           <div className="past-chat-hover__title">{pastChatTitle(session)}</div>
                           {preview && <div className="past-chat-hover__preview">{preview}</div>}
-                          {(turns || ts) && (
+                          {(turnsLabel || ts) && (
                             <div className="past-chat-hover__meta">
-                              {turns && <span>{t("composer.sessionTurns", { n: session.turns })}</span>}
+                              {turnsLabel && <span>{turnsLabel}</span>}
                               {ts && <span>· {fmtSessionTime(ts)}</span>}
                             </div>
                           )}
@@ -4107,7 +4525,7 @@ export function Composer({
                           <MessageSquare size={13} className="filemenu__icon" />
                           <span className="slashmenu__name slashmenu__name--file">
                             {pastChatTitle(session)}
-                            {turns ? ` (${t("composer.sessionTurns", { n: session.turns })})` : ""}
+                            {turnsLabel ? ` (${turnsLabel})` : ""}
                           </span>
                         </button>
                       </Tooltip>
@@ -4178,59 +4596,29 @@ export function Composer({
         ) : null
       )}
       {pendingGuidance.length > 0 && (
-        <div className="composer-guidance-shelf" aria-label={t("composer.guidanceQueue")}>
-          <div className="composer-guidance-head">
-            <span className="composer-guidance-head__label">
-              <CornerDownRight size={14} />
-              <span>{t("composer.guidanceCount", { n: pendingGuidance.length })}</span>
-            </span>
-          </div>
-          <div className="composer-guidance-list">
-            {visibleGuidance.map((item) => (
-              <div className="composer-guidance-item" key={item.id}>
-                <CornerDownRight size={14} className="composer-guidance-item__icon" />
-                <span className="composer-guidance-item__text">{item.text}</span>
-                <Tooltip label={t("composer.guidanceSend")}>
-                  <button
-                    className="composer-guidance-item__guide"
-                    type="button"
-                    aria-label={t("composer.guidanceSend")}
-                    disabled={!running || disabled || readOnly || guidanceSendingId !== null || Boolean(item.structured)}
-                    onClick={() => void sendQueuedGuidance(item)}
-                  >
-                    <CornerDownRight size={13} />
-                    <span>{t("composer.guidanceMode")}</span>
-                  </button>
-                </Tooltip>
-                <Tooltip label={t("composer.guidanceDismiss")}>
-                  <button
-                    className="composer-guidance-item__action"
-                    type="button"
-                    aria-label={t("composer.guidanceDismiss")}
-                    disabled={guidanceSendingId === item.id}
-                    onClick={() => updatePendingGuidanceForDraft(
-                      activeDraftKeyRef.current,
-                      (items) => items.filter((queued) => queued.id !== item.id),
-                    )}
-                  >
-                    <Trash2 size={14} />
-                  </button>
-                </Tooltip>
-              </div>
-            ))}
-            {showGuidanceExpander && (
-              <button
-                className="composer-guidance-more"
-                type="button"
-                aria-expanded={guidanceExpanded}
-                onClick={() => setGuidanceExpanded((value) => !value)}
-              >
-                {guidanceExpanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
-                <span>{guidanceExpanded ? t("composer.guidanceCollapse") : t("composer.guidanceRemaining", { n: hiddenGuidanceCount })}</span>
-              </button>
-            )}
-          </div>
-        </div>
+        <Suspense fallback={null}>
+          <ComposerGuidanceShelf
+            recovery={pendingGuidance[0]?.paused ? {
+              draftKey,
+              tabId: tabId || "",
+              count: pendingGuidance[0].recoveredCount || pendingGuidance.length,
+              recovered: Boolean(pendingGuidance[0].recoveredCount),
+            } : null}
+            recoveryDisabled={Boolean(disabled || readOnly)}
+            items={pendingGuidance}
+            expanded={guidanceExpanded}
+            running={running}
+            disabled={Boolean(disabled)}
+            readOnly={readOnly}
+            sendingId={guidanceSendingId}
+            onReview={() => setGuidanceExpanded(true)}
+            onRecoveryResumed={() => setGuidanceRetryNonce((value) => value + 1)}
+            onRecoveryError={(error) => showToast(formatInboxError(error, locale), "warn")}
+            onToggleExpanded={() => setGuidanceExpanded((value) => !value)}
+            onSend={(item) => void sendQueuedGuidance(item)}
+            onDismiss={(item) => void dismissQueuedGuidance(item)}
+          />
+        </Suspense>
       )}
       {(attachments.length > 0 || workspaceRefs.length > 0 || sessionRefs.length > 0 || selectedTextRefs.length > 0) && (
         <div className="composer-context" aria-label={t("composer.contextItems")}>
@@ -4272,7 +4660,7 @@ export function Composer({
                   <MessageSquare size={15} />
                   <span>
                     {ref.title}
-                    {typeof ref.turns === "number" ? ` (${t("composer.sessionTurns", { n: ref.turns })})` : ""}
+                    {sessionTurnsLabel(ref, t) ? ` (${sessionTurnsLabel(ref, t)})` : ""}
                   </span>
                 </span>
               </Tooltip>
@@ -4368,11 +4756,20 @@ export function Composer({
         {runStateText && (
           <div className={`composer-run-strip${waitingPrompt ? " composer-run-strip--waiting" : ""}`}>
             <span className="composer-run-strip__dot" aria-hidden="true" />
-            {/* The ticker re-renders every second; keep it out of the accessibility
-                tree and announce only the stable state text via the live region. */}
-            <span className="composer-run-strip__text" aria-hidden={runTicker ? true : undefined}>
-              {runTicker ?? runStateText}
-            </span>
+            {runTicker ? (
+              <>
+                <span className="composer-run-strip__text" aria-hidden="true">{runTicker.prefix}</span>
+                {runTicker.suffix && (
+                  <Tooltip label={t("composer.runStripEstimateHint")}>
+                    <span className="composer-run-strip__text" aria-hidden="true">{runTicker.suffix}</span>
+                  </Tooltip>
+                )}
+              </>
+            ) : (
+              <span className="composer-run-strip__text">
+                {runStateText}
+              </span>
+            )}
             <span className="sr-only" role="status">{runStateText}</span>
           </div>
         )}
@@ -4449,7 +4846,7 @@ export function Composer({
                   id="composer-input"
                   ref={taRef}
                   className="composer__input"
-                  aria-label={t("composer.placeholder")}
+                  aria-label={t("composer.placeholder")} spellCheck={false} autoCorrect="off" autoCapitalize="off"
                   value={text}
                   onInputCapture={(e) => {
                     pendingNativeInputTypeRef.current = (e.nativeEvent as InputEvent).inputType;
@@ -4509,6 +4906,86 @@ export function Composer({
                 </button>
               </Tooltip>
             )}
+            {sttEnabled && (
+              <Tooltip label={
+                <span className="composer-stt-tooltip">
+                  <span className="composer-stt-tooltip__action">
+                    {sttStarting ? t("composer.sttStarting") : (sttListening ? t("composer.sttStop") : t("composer.sttStart"))}
+                  </span>
+                  {sttInterimText && (
+                    <span className="composer-stt-tooltip__interim">
+                      {sttInterimText}
+                    </span>
+                  )}
+                  {(sttHotkeyStart || sttHotkeyStop) && (
+                    <span className="composer-stt-tooltip__hotkeys">
+                      {sttHotkeyStart && <span>{t("composer.sttHotkeyStartLabel")} {sttHotkeyStart}</span>}
+                      {sttHotkeyStop && <span>{t("composer.sttHotkeyStopLabel")} {sttHotkeyStop}</span>}
+                    </span>
+                  )}
+                </span>
+              }>
+                <button
+                  className={`composer__btn composer__btn--stt${sttListening ? " composer__btn--stt-active" : ""}${sttBusy || sttStarting ? " composer__btn--disabled" : ""}`}
+                  type="button"
+                  onClick={() => void toggleSTT()}
+                  disabled={sttBusy || sttStarting || disabled || readOnly}
+                  aria-label={sttStarting ? t("composer.sttStarting") : (sttListening ? t("composer.sttStop") : t("composer.sttStart"))}
+                  aria-pressed={sttListening}
+                >
+                  {sttStarting ? (
+                    // 启动中：加载动画反馈，避免用户以为没功能而重复点击。
+                    <Loader2 size={15} className="composer__btn--spinning" />
+                  ) : sttListening ? (
+                    <Mic size={15} fill="currentColor" />
+                  ) : (
+                    <MicOff size={15} />
+                  )}
+                </button>
+              </Tooltip>
+            )}
+            <Tooltip label={enhancedOriginal != null ? t("composer.enhanceRevert") : t("composer.enhance")}>
+              <button
+                className={`composer__btn composer__btn--enhance${enhancedOriginal != null ? " composer__btn--enhance-active" : ""}${enhancing ? " composer__btn--disabled" : ""}`}
+                type="button"
+                onClick={() => {
+                  if (enhancing) {
+                    void cancelEnhancePrompt(); // 转圈中点击 = 取消
+                  } else if (enhancedOriginal != null && textRef.current.trim() === (enhancedResult ?? "").trim()) {
+                    void revertEnhancedPrompt(); // 增强后未修改 = 还原原文
+                  } else {
+                    void enhancePrompt(); // 未增强 / 增强后又补充了内容 = （再次）增强
+                  }
+                }}
+                disabled={disabled || readOnly}
+                aria-label={
+                  enhancing
+                    ? t("composer.enhanceCancel")
+                    : (enhancedOriginal != null && textRef.current.trim() === (enhancedResult ?? "").trim())
+                      ? t("composer.enhanceRevert")
+                      : t("composer.enhance")
+                }
+              >
+                {enhancing ? (
+                  // 运行中默认转圈；鼠标悬停（hover）时切换为叉叉，提示可取消。
+                  // 进度文本（已等待秒数 / 重试中 n/m）实时可见，消除"转好久
+                  // 无反馈"的焦虑；hover 时隐藏以免与取消提示抢空间。
+                  <span className="composer__btn--enhance-status">
+                    <Loader2 size={15} className="composer__btn--spinning" />
+                    <X size={15} className="composer__btn--enhance-cancel" />
+                    {(enhanceRetry || enhanceElapsed > 0) && (
+                      <span className="composer__btn--enhance-progress">
+                        {enhanceRetry
+                          ? t("composer.enhanceRetrying", { n: enhanceRetry.attempt, m: enhanceRetry.max })
+                          : `${enhanceElapsed}s`}
+                      </span>
+                    )}
+                  </span>
+                ) : (enhancedOriginal != null && textRef.current.trim() === (enhancedResult ?? "").trim())
+                  ? <Undo2 size={15} />
+                  : <Wand2 size={15} />}
+              </button>
+            </Tooltip>
             <Tooltip label={submitTooltip}>
               <button
                 className={`composer__btn composer__btn--send${running ? " composer__btn--steer" : ""}`}
@@ -4671,12 +5148,12 @@ export function Composer({
               )}
               <ModelSwitcher label={modelLabel} tabId={tabId} onPick={onSwitchModel} />
             </div>
-            {!heroMode && hasEffort && (
+            {hasEffort && (
               <div className="composer-meta__control composer-meta__control--effort">
                 <EffortSwitcher effort={effort} disabled={running} onPick={onSetEffort} />
               </div>
             )}
-            {!heroMode && hasEffort && (
+            {hasEffort && (
               <div className="composer-meta__control composer-meta__control--more">
                 <Tooltip label={compactEffortTitle} disabled={moreMenuOpen || moreMenuClosing}>
                   <button

@@ -5,9 +5,20 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync/atomic"
 
 	"reasonix/internal/evidence"
 )
+
+// recoveryIdentity is who this agent is to the shared gate: the labels a
+// recovery card shows, and a run counter that keeps ordinary (non-goal) runs of
+// one task in collision-free scopes. Goal runs use their stable delivery scope
+// instead, so the counter is only ever read through recoveryTaskScopeID.
+type recoveryIdentity struct {
+	agentID string        // empty = root
+	taskID  string        // empty shares the root task bucket
+	runSeq  atomic.Uint64 // bumped per Run; never reset
+}
 
 // RecoveryGate is the host-side Auto Guard consulted by the agent around tool
 // execution. It is independent of the permission Gate and of
@@ -124,6 +135,9 @@ type RecoveryProposal struct {
 	// the isolated reviewer. They are internal evidence, not persisted wire state.
 	PlanBefore string
 	PlanAfter  string
+	// PlanDiff pairs the two revisions by step id, so the reviewer is told what
+	// moved instead of diffing two clipped renderings itself.
+	PlanDiff string
 	// SafeRetry is true when the host can prove this is a same-strategy
 	// verification/idempotent retry (e.g. re-running the same test command).
 	SafeRetry bool
@@ -205,9 +219,9 @@ func (a *Agent) observeRecoveryResult(ctx context.Context, toolName string, args
 		}
 	}
 	guidance := a.recoveryGate.ObserveResult(ctx, RecoveryObservation{
-		AgentID:      a.recoveryAgentID,
-		TaskID:       a.recoveryTaskID,
-		TaskScopeID:  recoveryTaskScopeID(a.deliveryScopeID, a.recoveryRunSeq.Load()),
+		AgentID:      a.recovery.agentID,
+		TaskID:       a.recovery.taskID,
+		TaskScopeID:  recoveryTaskScopeID(a.deliveryScopeID, a.recovery.runSeq.Load()),
 		EpisodeID:    episodeID,
 		Generation:   generation,
 		Tool:         toolName,

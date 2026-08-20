@@ -4,9 +4,12 @@
 
 import {
   canUsePromptHistory,
+  composerEscapeAction,
   composerEnterAction,
+  composerMenuKeyAction,
   insertComposerNewline,
   isFnKeyEvent,
+  isImeKeyEvent,
   promptHistoryDirectionFromEvent,
   type PromptHistoryDirection,
 } from "../lib/composerKeyboard";
@@ -60,11 +63,11 @@ eq(isFnKeyEvent({ key: "ArrowUp", getModifierState: (key) => key === "Fn" }), tr
 
 eq(eligible("up", { value: "", selectionStart: 0, selectionEnd: 0 }), true, "empty input ArrowUp can recall history");
 eq(eligible("down", { value: "", selectionStart: 0, selectionEnd: 0 }), false, "empty input ArrowDown does not start history");
-eq(eligible("up", { value: "draft", selectionStart: 5, selectionEnd: 5 }), false, "ArrowUp at draft end keeps native textarea movement");
+eq(eligible("up", { value: "draft", selectionStart: 5, selectionEnd: 5 }), true, "ArrowUp recalls history regardless of cursor position");
 eq(eligible("up", { value: "draft", selectionStart: 0, selectionEnd: 0 }), true, "ArrowUp at first position recalls history");
 eq(eligible("down", { value: "history", selectionStart: 7, selectionEnd: 7, historyIndex: 0 }), true, "ArrowDown at recalled history end moves newer");
 eq(eligible("down", { value: "history", selectionStart: 3, selectionEnd: 3, historyIndex: 0 }), false, "ArrowDown inside text keeps native movement");
-eq(eligible("up", { value: "line1\nline2", selectionStart: 7, selectionEnd: 7 }), false, "ArrowUp inside multiline text keeps native movement");
+eq(eligible("up", { value: "line1\nline2", selectionStart: 7, selectionEnd: 7 }), true, "ArrowUp recalls history even inside multiline text");
 eq(eligible("up", { value: "history", selectionStart: 7, selectionEnd: 7, historyIndex: 0 }), true, "history mode allows repeated ArrowUp");
 eq(eligible("up", { value: "", selectionStart: 0, selectionEnd: 0, fnKey: true }), false, "Fn-modified arrows are not history shortcuts");
 eq(eligible("up", { value: "", selectionStart: 0, selectionEnd: 0, shiftKey: true }), false, "Shift+Arrow preserves selection behavior");
@@ -94,6 +97,54 @@ eq(composerEnterAction({ key: "Enter", altKey: true }, "linux"), "none", "a cust
 resetCustomShortcuts();
 eq(composerEnterAction({ key: "Enter" }, "darwin"), "send", "reset restores plain-Enter send");
 eq(composerEnterAction({ key: "Enter", shiftKey: true }, "darwin"), "newline-native", "reset restores the Shift+Enter default");
+
+console.log("\ncomposerEscapeAction / IME gating");
+
+eq(composerEscapeAction({ key: "Escape" }, true, true), "pass-through", "Escape passes through while composition is active");
+eq(composerEscapeAction({ key: "Escape" }, true, false), "cancel", "plain Escape cancels a running turn");
+eq(composerEscapeAction({ key: "Escape" }, false, false), "pass-through", "Escape does not cancel an idle composer");
+eq(composerEscapeAction({ key: "Enter" }, true, false), "pass-through", "non-Escape keys do not trigger cancellation");
+
+console.log("\ncomposerMenuKeyAction / IME gating");
+
+eq(composerMenuKeyAction({ key: "Escape" }, true), "pass-through", "IME Escape stays with the input");
+eq(composerMenuKeyAction({ key: "Enter" }, true), "pass-through", "IME Enter stays with the input");
+eq(composerMenuKeyAction({ key: "ArrowDown" }, true), "pass-through", "IME ArrowDown stays with the input");
+eq(composerMenuKeyAction({ key: "Escape" }, false), "handle", "plain Escape is handled by the menu");
+eq(composerMenuKeyAction({ key: "Enter" }, false), "handle", "plain Enter is handled by the menu");
+eq(composerMenuKeyAction({ key: "a" }, false), "pass-through", "typing keys pass through menu navigation");
+
+const now = 10_000;
+eq(
+  isImeKeyEvent({ key: "Escape", isComposing: true }, false, 0, now),
+  true,
+  "native isComposing protects IME Escape",
+);
+eq(
+  isImeKeyEvent({ key: "Escape", keyCode: 229 }, false, 0, now),
+  true,
+  "legacy keyCode 229 protects IME Escape",
+);
+eq(
+  isImeKeyEvent({ key: "Escape" }, true, 0, now),
+  true,
+  "composition ref protects IME Escape",
+);
+eq(
+  isImeKeyEvent({ key: "Escape" }, false, now - 99, now),
+  true,
+  "recent compositionend grace protects IME Escape",
+);
+eq(
+  isImeKeyEvent({ key: "Escape" }, false, now - 100, now),
+  false,
+  "compositionend grace expires at its boundary",
+);
+eq(
+  isImeKeyEvent({ key: "Escape" }, false, now - 101, now),
+  false,
+  "stale compositionend does not block plain Escape",
+);
 
 const boundaryInvocations: ComposerInvocation[] = [
   { id: "first", offset: 0, command: { name: "first", description: "First skill", kind: "skill" } },
